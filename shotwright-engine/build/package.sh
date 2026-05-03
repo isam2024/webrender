@@ -80,7 +80,9 @@ Drop-in install (cPanel-style shared host):
        \$png = shell_exec(escapeshellcmd(\$bin) . ' https://example.com');
      Or use the shotwright PHP composer package.
 
-Requires glibc 2.35 or newer (Ubuntu 22.04+, AlmaLinux 10+, RHEL 10+, Debian 12+).
+Requires glibc 2.28 or newer — runs on AlmaLinux 8+, Rocky 8+, RHEL 8+,
+CloudLinux 8+, Ubuntu 20.04+, Debian 11+. This covers most cPanel-style
+shared hosting alongside any modern VPS.
 
 Bundled fonts live in ./fonts. shotwright will search this directory
 relative to its own path, so do NOT separate the binary from the fonts/.

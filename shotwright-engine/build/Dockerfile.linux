@@ -1,47 +1,63 @@
 # Build container for shotwright on glibc Linux.
 #
-# Why Ubuntu 22.04 (jammy):
-#   - This is Servo's primary CI target — toolchain alignment is the most
-#     battle-tested combination for SpiderMonkey + WebRender.
-#   - Python 3.10 is the system default (TypeGuard available; no source build).
-#   - clang 14 + gcc 11 align cleanly with mozjs's bindgen invocation.
-#   - glibc 2.35 — works on Ubuntu 22.04+ and AlmaLinux 10+ / RHEL 10+.
-#     Note: this excludes AlmaLinux 9 / RHEL 9 (glibc 2.34); for those, build
-#     a separate variant from a glibc 2.31 base.
+# Why AlmaLinux 8 (el8):
+#   - glibc 2.28 — the lowest glibc we can reasonably target. Runs on:
+#       * AlmaLinux 8 / Rocky 8 / RHEL 8 / CentOS 8
+#       * AlmaLinux 9 / Rocky 9 / RHEL 9 (forward compat from 2.28 to 2.34)
+#       * Ubuntu 20.04+, Debian 11+
+#       * CloudLinux 8 — covers a huge slice of cheap cPanel hosting
+#   - Modern Python 3.11 + GCC 12 are available via AppStream module / SCL,
+#     so we don't need to bootstrap them from source.
 #
 # The image produces /out/shotwright plus /out/fonts. The PHP wrapper expects
 # this layout.
 
-FROM ubuntu:22.04 AS builder
+FROM almalinux:8 AS builder
 
 ARG TARGET=x86_64-unknown-linux-gnu
 ARG RUST_VERSION=1.94.1
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PATH=/root/.cargo/bin:$PATH \
+ENV PATH=/root/.cargo/bin:/opt/rh/gcc-toolset-12/root/usr/bin:$PATH \
     CARGO_NET_RETRY=10 \
-    # Fully serialized so peak C++ memory is one cc1plus (~4 GB) and the
-    # build container stays inside its --memory cap. Slow but predictable.
+    # Fully serialized C++ to fit comfortably in any CI runner. Override
+    # via Dockerfile arg / env when building on a fat host.
     MAKEFLAGS=-j1 \
     MOZ_PARALLEL_BUILD=1 \
     CARGO_BUILD_JOBS=1
 
-# Servo + mozjs build dependencies. autoconf-2.13 is required by mozjs's
-# legacy SpiderMonkey build scripts.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl xz-utils file pkg-config \
-        build-essential clang libclang-dev llvm \
-        cmake ninja-build \
-        autoconf2.13 automake libtool m4 \
-        python3 python3-pip python3-distutils-extra \
-        perl \
-        libfontconfig1-dev libfreetype6-dev libharfbuzz-dev \
-        libssl-dev zlib1g-dev libbz2-dev libffi-dev \
-        libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev \
-        libxcb1-dev libx11-xcb-dev \
-        libdbus-1-dev \
-    && rm -rf /var/lib/apt/lists/* && \
+# Servo + mozjs build dependencies on AlmaLinux 8.
+# - gcc-toolset-12: modern g++/gcc (stock el8 has gcc 8 which is too old)
+# - llvm-toolset: clang for bindgen
+# - python3.11: TypeGuard etc. (stock el8 has 3.6)
+# - autoconf213: legacy autoconf for SpiderMonkey
+RUN dnf install -y dnf-plugins-core epel-release && \
+    dnf config-manager --set-enabled powertools && \
+    dnf install -y \
+        ca-certificates curl xz file pkgconf-pkg-config which \
+        gcc-toolset-12 gcc-toolset-12-libstdc++-devel \
+        llvm-toolset \
+        cmake ninja-build make \
+        autoconf213 automake libtool m4 \
+        python3.11 python3.11-devel python3.11-pip \
+        perl perl-FindBin perl-File-Compare \
+        fontconfig-devel freetype-devel harfbuzz-devel \
+        openssl-devel zlib-devel bzip2-devel libffi-devel \
+        mesa-libGL-devel mesa-libEGL-devel \
+        libxcb-devel libX11-devel \
+        dbus-devel \
+        glibc-devel binutils \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+# Make python3.11 the default `python3` and `python` for build scripts.
+RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python3 && \
+    ln -sf /usr/bin/python3.11 /usr/local/bin/python && \
     python3 --version
+
+# Activate gcc-toolset-12 + clang for the rest of the build. We also export
+# CC/CXX so cargo's cc-rs picks up the right compilers.
+ENV CC=/opt/rh/gcc-toolset-12/root/usr/bin/gcc \
+    CXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++ \
+    LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64
 
 # Rust toolchain via rustup, pinned.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
@@ -52,9 +68,8 @@ WORKDIR /src
 
 # Two-stage build for cache friendliness:
 #   1. Compile every dependency against a stub main.rs (the slow ~60 min part).
-#      This layer is invalidated only when Cargo.toml / Cargo.lock change.
+#      Invalidated only when Cargo.toml / Cargo.lock change.
 #   2. Compile our own src/. Invalidated whenever main.rs or render.rs change.
-# Without this split, every src/ tweak forces a full SpiderMonkey rebuild.
 
 COPY Cargo.toml Cargo.lock* ./
 RUN mkdir -p src && \
@@ -73,16 +88,17 @@ RUN cargo build --release --target ${TARGET} --bin shotwright && \
     (strip /out/shotwright || echo "strip skipped")
 
 # Stage the fonts a screenshot tool actually needs in a "no system fonts" host.
-# DejaVu covers Latin/Greek/Cyrillic/IPA. Noto CJK + Noto Color Emoji cover
+# DejaVu covers Latin/Greek/Cyrillic/IPA. Noto + Noto CJK + Noto Emoji cover
 # the rest of the legible web. Anything else falls back gracefully.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        fonts-dejavu-core fonts-noto-core fonts-noto-cjk-extra fonts-noto-color-emoji \
-    && rm -rf /var/lib/apt/lists/* && \
+RUN dnf install -y \
+        dejavu-sans-fonts dejavu-serif-fonts dejavu-sans-mono-fonts \
+        google-noto-sans-fonts google-noto-serif-fonts \
+        google-noto-sans-cjk-ttc-fonts google-noto-serif-cjk-ttc-fonts \
+        google-noto-emoji-fonts google-noto-emoji-color-fonts \
+    && dnf clean all && \
     install -d /out/fonts && \
-    cp -r /usr/share/fonts/truetype/dejavu /out/fonts/ && \
-    cp -r /usr/share/fonts/truetype/noto /out/fonts/ 2>/dev/null || true && \
-    cp -r /usr/share/fonts/opentype/noto /out/fonts/noto-otf 2>/dev/null || true && \
-    cp -r /usr/share/fonts/truetype/noto-cjk /out/fonts/ 2>/dev/null || true
+    cp -r /usr/share/fonts/dejavu /out/fonts/ 2>/dev/null || true && \
+    cp -r /usr/share/fonts/google-noto* /out/fonts/ 2>/dev/null || true
 
 # Final stage: just the artifacts.
 FROM scratch AS artifact

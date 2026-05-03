@@ -22,7 +22,7 @@ maintained engine.**
 - **JavaScript**: yes (SpiderMonkey, integrated)
 - **Binary size**: ~300 MB stripped (full browser engine; SPA-capable)
 - **Memory**: ~200–400 MB per capture
-- **Platforms**: x86_64 and aarch64 Linux, glibc ≥ 2.31
+- **Platforms**: x86_64 and aarch64 Linux, glibc ≥ 2.28 (covers AlmaLinux 8+, Rocky 8+, CloudLinux 8+, Ubuntu 20.04+, Debian 11+)
 
 This project is alpha. The binary hasn't been published to GitHub Releases
 yet — the build pipeline (`build/Dockerfile.linux`, `build/package.sh`,
@@ -39,8 +39,8 @@ yet — the build pipeline (`build/Dockerfile.linux`, `build/package.sh`,
 | Active maintenance post-2024 | ✅ (Servo, monthly releases) |
 | Modern HTML/CSS, including SPAs | ✅ (SpiderMonkey integrated) |
 | 256–512 MB RAM ceiling | ⚠️ tight — full browser; expect 200–400 MB |
-| Static binary (musl) | ❌ → glibc 2.31+. cPanel hosts are ~all glibc; full musl static link with mozjs/fontconfig/freetype is impractical |
-| Runs on RHEL 7 / CentOS 7 era | ❌ — glibc 2.31 cutoff excludes those |
+| Static binary (musl) | ❌ → glibc 2.28+. cPanel hosts are ~all glibc; full musl static link with mozjs/fontconfig/freetype is impractical |
+| Runs on RHEL 7 / CentOS 7 era | ❌ — glibc 2.28 cutoff excludes those |
 
 The musl→glibc relaxation is the main tradeoff. cPanel-style hosting in
 2026 is essentially all glibc Linux ≥ 2.31; the binary works there. If
@@ -53,7 +53,7 @@ with `FROM centos:7` (substantial work).
 shotwright-engine/         Rust crate — the binary
   src/main.rs              CLI surface (clap)
   src/render.rs            Servo driver: load URL, take_screenshot, full-page
-  build/Dockerfile.linux   Reproducible build container (Debian 11)
+  build/Dockerfile.linux   Reproducible build container (AlmaLinux 8)
   build/package.sh         Builds the artifact tarball
 shotwright-php/            Composer package — the PHP wrapper
   src/Shotwright.php       Main class: capture(), captureToFile()
