@@ -32,26 +32,28 @@ mkdir -p "${STAGE}"
 DOCKER_PLATFORM="linux/amd64"
 [ "${ARCH}" = "aarch64" ] && DOCKER_PLATFORM="linux/arm64"
 
-# `docker buildx build` doesn't accept --memory directly. To bound the build's
-# RAM (so we don't starve other containers on a shared Docker VM), we create
-# a one-shot containerized buildx builder with a memory cap, use it, then
-# remove it on exit. Tune via BUILD_MEM (e.g. BUILD_MEM=8g for fatter hosts).
-BUILD_MEM="${BUILD_MEM:-5g}"
-BUILDER="shotwright-bldr-$$"
-
-cleanup_builder() {
-    docker buildx rm "${BUILDER}" >/dev/null 2>&1 || true
-}
-trap cleanup_builder EXIT INT TERM
-
-docker buildx create \
-    --name "${BUILDER}" \
-    --driver docker-container \
-    --driver-opt "memory=${BUILD_MEM},memory-swap=${BUILD_MEM}" \
-    --bootstrap >/dev/null
+# Memory cap is opt-in. Set BUILD_MEM (e.g. BUILD_MEM=5g) when building on a
+# shared Docker VM that's running other containers — it spawns a containerized
+# buildx builder with a hard ceiling so the build can't starve them. CI
+# runners have dedicated RAM (~16 GB on GH ubuntu-latest), so leave it unset
+# there to give rustc the room it needs for servo-script.
+BUILDX_FLAGS=()
+if [ -n "${BUILD_MEM:-}" ]; then
+    BUILDER="shotwright-bldr-$$"
+    cleanup_builder() {
+        docker buildx rm "${BUILDER}" >/dev/null 2>&1 || true
+    }
+    trap cleanup_builder EXIT INT TERM
+    docker buildx create \
+        --name "${BUILDER}" \
+        --driver docker-container \
+        --driver-opt "memory=${BUILD_MEM},memory-swap=${BUILD_MEM}" \
+        --bootstrap >/dev/null
+    BUILDX_FLAGS+=(--builder "${BUILDER}")
+fi
 
 docker buildx build \
-    --builder "${BUILDER}" \
+    "${BUILDX_FLAGS[@]}" \
     --platform "${DOCKER_PLATFORM}" \
     --build-arg "TARGET=${TARGET}" \
     -f build/Dockerfile.linux \
