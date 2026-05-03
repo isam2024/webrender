@@ -1,0 +1,99 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * One-shot installer that downloads the matching shotwright binary tarball
+ * for the current host and unpacks it to ~/bin/shotwright/.
+ *
+ * Run this once on the deployment host *after* `composer install`:
+ *
+ *   vendor/bin/shotwright-install
+ *
+ * Or pin a specific version:
+ *
+ *   vendor/bin/shotwright-install --version=0.1.0
+ *
+ * Sets up the binary so the BinaryLocator's default search path finds it
+ * with no further configuration.
+ */
+
+const REPO          = 'shotwright/shotwright';
+const DEFAULT_VER   = '0.1.0';
+const INSTALL_DIR   = '/bin/shotwright';
+
+function main(array $argv): int
+{
+    $version = DEFAULT_VER;
+    foreach (array_slice($argv, 1) as $arg) {
+        if (str_starts_with($arg, '--version=')) {
+            $version = substr($arg, 10);
+        } elseif ($arg === '-h' || $arg === '--help') {
+            echo "Usage: shotwright-install [--version=X.Y.Z]\n";
+            return 0;
+        }
+    }
+
+    $arch = detectArch();
+    $home = getenv('HOME') ?: throwError('HOME not set');
+    $dest = rtrim($home, '/') . INSTALL_DIR;
+
+    $target  = "{$arch}-unknown-linux-gnu";
+    $name    = "shotwright-{$version}-{$target}";
+    $url     = "https://github.com/" . REPO . "/releases/download/v{$version}/{$name}.tar.gz";
+
+    fprintf(STDERR, "Downloading %s\n", $url);
+    $tmp = tempnam(sys_get_temp_dir(), 'shotwright-tar-');
+    $rc  = passthru("curl -fLsS " . escapeshellarg($url) . " -o " . escapeshellarg($tmp), $exit);
+    if ($exit !== 0) {
+        @unlink($tmp);
+        throwError("download failed");
+    }
+
+    @mkdir(dirname($dest), 0o755, true);
+    if (is_dir($dest)) {
+        fprintf(STDERR, "Removing existing %s\n", $dest);
+        passthru("rm -rf " . escapeshellarg($dest));
+    }
+
+    $parent = dirname($dest);
+    fprintf(STDERR, "Extracting to %s\n", $parent);
+    passthru(
+        "tar -xzf " . escapeshellarg($tmp) . " -C " . escapeshellarg($parent),
+        $exit,
+    );
+    @unlink($tmp);
+    if ($exit !== 0) {
+        throwError("extract failed");
+    }
+
+    $extracted = $parent . '/' . $name;
+    if (!is_dir($extracted)) {
+        throwError("expected {$extracted} after extract");
+    }
+    rename($extracted, $dest);
+    chmod($dest . '/shotwright', 0o755);
+
+    fprintf(STDERR, "Installed: %s\n", $dest . '/shotwright');
+    fprintf(STDERR, "Test it:   %s --help\n", $dest . '/shotwright');
+    return 0;
+}
+
+function detectArch(): string
+{
+    $u = trim((string) shell_exec('uname -m'));
+    return match ($u) {
+        'x86_64', 'amd64'  => 'x86_64',
+        'aarch64', 'arm64' => 'aarch64',
+        default            => throwError("unsupported arch: {$u}"),
+    };
+}
+
+function throwError(string $msg): never
+{
+    fwrite(STDERR, "shotwright-install: {$msg}\n");
+    exit(1);
+}
+
+exit(main($argv));

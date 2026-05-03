@@ -1,0 +1,8 @@
+target/
+dist/
+vendor/
+composer.lock
+.phpunit.cache/
+.phpunit.result.cache
+*.tar.gz
+.DS_Store
