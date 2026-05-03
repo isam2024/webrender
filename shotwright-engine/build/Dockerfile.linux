@@ -39,7 +39,7 @@ RUN dnf install -y dnf-plugins-core epel-release && \
         cmake ninja-build make \
         autoconf213 automake libtool m4 \
         python3.11 python3.11-devel python3.11-pip \
-        perl perl-FindBin perl-File-Compare \
+        perl \
         fontconfig-devel freetype-devel harfbuzz-devel \
         openssl-devel zlib-devel bzip2-devel libffi-devel \
         mesa-libGL-devel mesa-libEGL-devel \
