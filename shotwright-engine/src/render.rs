@@ -17,7 +17,7 @@
 use anyhow::{Context, Result, bail};
 use dpi::PhysicalSize;
 use servo::{
-    JSValue, RgbaImage, ServoBuilder, SoftwareRenderingContext, WebViewBuilder,
+    JSValue, RenderingContext, RgbaImage, ServoBuilder, SoftwareRenderingContext, WebViewBuilder,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -143,7 +143,10 @@ fn run_eval_number(
         }
         servo.spin_event_loop();
     }
-    match slot.borrow_mut().take().unwrap() {
+    // Bind the result to a local before the match so the RefMut temporary
+    // is dropped before `slot` itself is dropped at end of scope.
+    let result = slot.borrow_mut().take().unwrap();
+    match result {
         Ok(JSValue::Number(n)) => Ok(n),
         Ok(other) => bail!("expected JS number, got {other:?}"),
         Err(e) => bail!("JS evaluation error: {e}"),
