@@ -17,12 +17,51 @@
 use anyhow::{Context, Result, bail};
 use dpi::PhysicalSize;
 use servo::{
-    JSValue, RenderingContext, RgbaImage, ServoBuilder, SoftwareRenderingContext, WebViewBuilder,
+    JSValue, LoadStatus, RenderingContext, RgbaImage, ServoBuilder, SoftwareRenderingContext,
+    WebView, WebViewBuilder, WebViewDelegate,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use url::Url;
+
+/// Verbose diagnostic stderr output. Activated by `SHOTWRIGHT_DEBUG=1`.
+fn debug_enabled() -> bool {
+    std::env::var_os("SHOTWRIGHT_DEBUG").is_some()
+}
+
+macro_rules! dlog {
+    ($($arg:tt)*) => {
+        if debug_enabled() {
+            eprintln!("[shotwright] {}", format_args!($($arg)*));
+        }
+    };
+}
+
+/// Surfaces the page-load lifecycle to stderr. Without a delegate, every
+/// notification (load progress, crashes, navigations) is silently dropped,
+/// which made the timeout-with-no-output failure mode opaque.
+struct DebugDelegate;
+impl WebViewDelegate for DebugDelegate {
+    fn notify_load_status_changed(&self, _wv: WebView, status: LoadStatus) {
+        dlog!("load_status: {status:?}");
+    }
+    fn notify_url_changed(&self, _wv: WebView, url: Url) {
+        dlog!("url_changed: {url}");
+    }
+    fn notify_page_title_changed(&self, _wv: WebView, t: Option<String>) {
+        dlog!("page_title: {t:?}");
+    }
+    fn notify_crashed(&self, _wv: WebView, reason: String, bt: Option<String>) {
+        eprintln!("[shotwright] CRASHED: {reason}");
+        if let Some(b) = bt {
+            eprintln!("[shotwright] backtrace: {b}");
+        }
+    }
+    fn notify_new_frame_ready(&self, _wv: WebView) {
+        dlog!("new_frame_ready");
+    }
+}
 
 pub struct RenderOptions {
     pub url: Url,
@@ -51,11 +90,17 @@ pub fn capture(opts: RenderOptions) -> Result<Vec<u8>> {
     let _ = &opts.user_agent;
 
     let servo = ServoBuilder::default().build();
+    if debug_enabled() {
+        servo.setup_logging();
+        dlog!("servo built; rendering_context size={:?}", initial_size);
+    }
 
     let webview = WebViewBuilder::new(&servo, rendering_context.clone())
         .url(opts.url.clone())
+        .delegate(Rc::new(DebugDelegate))
         .build();
     webview.show();
+    dlog!("webview built and shown; url={}", opts.url);
 
     // Phase 1: capture at the requested viewport. take_screenshot internally
     // waits for the document, all subresources, and pending render frames.
@@ -111,12 +156,26 @@ fn run_screenshot(
             *slot.borrow_mut() = Some(r.map_err(|e| format!("{e:?}")));
         });
     }
+    dlog!("take_screenshot dispatched; pumping event loop");
     let deadline = Instant::now() + timeout;
+    let mut last_log = Instant::now();
     while slot.borrow().is_none() {
         if Instant::now() >= deadline {
-            bail!("timeout waiting for screenshot after {}s", timeout.as_secs());
+            bail!(
+                "timeout waiting for screenshot after {}s (last load_status: {:?})",
+                timeout.as_secs(),
+                webview.load_status()
+            );
         }
         servo.spin_event_loop();
+        if debug_enabled() && last_log.elapsed() >= Duration::from_secs(2) {
+            dlog!(
+                "still waiting; load_status={:?} animating={}",
+                webview.load_status(),
+                webview.clone().animating()
+            );
+            last_log = Instant::now();
+        }
     }
     let result = slot.borrow_mut().take().unwrap();
     result.map_err(|e| anyhow::anyhow!("screenshot capture failed: {e}"))
