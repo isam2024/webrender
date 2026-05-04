@@ -82,6 +82,15 @@ fn run(cli: Cli) -> Result<()> {
     if cli.width > 8192 || cli.height > 16384 {
         bail!("requested viewport exceeds safety limits (max 8192x16384)");
     }
+    if cli.timeout == 0 || cli.timeout > 600 {
+        bail!("--timeout must be between 1 and 600 seconds");
+    }
+    if !(0.1..=4.0).contains(&cli.dpr) {
+        bail!("--dpr must be between 0.1 and 4.0");
+    }
+    if cli.settle_ms > 60_000 {
+        bail!("--settle-ms must not exceed 60000");
+    }
 
     let opts = render::RenderOptions {
         url,

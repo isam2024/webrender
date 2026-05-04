@@ -2,17 +2,26 @@
 //!
 //! Public surface is intentionally narrow: `capture(RenderOptions) -> Vec<u8>`.
 //!
-//! Servo 0.1.x exposes:
-//!   - `ServoBuilder::default().build()` to construct an engine
-//!   - `SoftwareRenderingContext::new(PhysicalSize)` for headless CPU rendering
-//!     (no display server, no GPU)
-//!   - `WebViewBuilder::new(&servo, rc).url(url).build()` to create a webview
-//!   - `WebView::take_screenshot(rect, callback)` — async, fires a callback when
-//!     fonts/images/stylesheets have all settled
+//! The shape of this code matches Servo's own test harness in
+//! `servo/tests/common/mod.rs` and `servo/tests/webview.rs`, which is the
+//! authoritative example for headless rendering against
+//! `SoftwareRenderingContext`. Three details that aren't obvious from the
+//! public docs but are required:
 //!
-//! `take_screenshot` and `evaluate_javascript` are callback-based, so we bridge
-//! them into the calling thread with `Rc<RefCell<Option<_>>>` and pump the event
-//! loop until the cell is filled or the deadline passes.
+//!   1. `rendering_context.make_current()` must be called after construction
+//!      so the OpenGL context is bound to this thread. The screenshot
+//!      pipeline's `read_to_image` reads pixels from this context.
+//!   2. Spin the event loop (`servo.spin_event_loop()`) with a small sleep
+//!      between iterations — `take_screenshot`'s callback is fired from
+//!      inside the painter, which runs as part of `spin_event_loop`'s work.
+//!   3. Wait for `LoadStatus::Complete` via the `WebViewDelegate` before
+//!      dispatching `take_screenshot`. Calling it earlier means the
+//!      screenshot-readiness handshake races with `pending_changes` clearing
+//!      in the constellation, and the callback may never fire.
+//!
+//! Notably, headless rendering does NOT require explicit `webview.paint()` /
+//! `rendering_context.present()` calls (those are for windowed embedders like
+//! the winit example). The painter drives compositing internally.
 
 use anyhow::{Context, Result, bail};
 use dpi::PhysicalSize;
@@ -22,6 +31,7 @@ use servo::{
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -38,25 +48,14 @@ macro_rules! dlog {
     };
 }
 
-/// Delegate that bridges Servo's `notify_new_frame_ready` events to a flag
-/// the main loop checks. When the flag is set, the main loop calls
-/// `webview.paint()` + `rendering_context.present()` — without this, frames
-/// are generated but never composited into the rendering context, and
-/// `take_screenshot`'s "rendering is up to date" wait condition never trips.
-///
-/// Without an explicit delegate, every notification is silently dropped,
-/// which is what made the original "timeout, no PNG" failure mode opaque.
-/// Debug prints are gated on `SHOTWRIGHT_DEBUG=1`.
+/// `WebViewDelegate` that surfaces lifecycle events to flags the main loop
+/// can poll. Without an explicit delegate, every notification (load progress,
+/// crashes, navigations) is silently dropped.
 struct RenderDelegate {
-    needs_paint: Rc<Cell<bool>>,
     load_complete: Rc<Cell<bool>>,
 }
 
 impl WebViewDelegate for RenderDelegate {
-    fn notify_new_frame_ready(&self, _wv: WebView) {
-        self.needs_paint.set(true);
-        dlog!("new_frame_ready");
-    }
     fn notify_load_status_changed(&self, _wv: WebView, status: LoadStatus) {
         dlog!("load_status: {status:?}");
         if matches!(status, LoadStatus::Complete) {
@@ -68,6 +67,9 @@ impl WebViewDelegate for RenderDelegate {
     }
     fn notify_page_title_changed(&self, _wv: WebView, t: Option<String>) {
         dlog!("page_title: {t:?}");
+    }
+    fn notify_new_frame_ready(&self, _wv: WebView) {
+        dlog!("new_frame_ready");
     }
     fn notify_crashed(&self, _wv: WebView, reason: String, bt: Option<String>) {
         eprintln!("[shotwright] CRASHED: {reason}");
@@ -88,6 +90,28 @@ pub struct RenderOptions {
     pub user_agent: Option<String>,
 }
 
+/// Spin Servo's event loop until `done` returns true, the `deadline` passes,
+/// or `timeout_msg` is bailed. Mirrors `ServoTest::spin` in Servo's own tests:
+/// busy-loop with a 1 ms sleep so we don't pin a CPU but stay responsive.
+fn spin_until<F>(
+    servo: &servo::Servo,
+    deadline: Instant,
+    timeout_msg: &str,
+    mut done: F,
+) -> Result<()>
+where
+    F: FnMut() -> bool,
+{
+    while !done() {
+        if Instant::now() >= deadline {
+            bail!("{timeout_msg}");
+        }
+        servo.spin_event_loop();
+        thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
 pub fn capture(opts: RenderOptions) -> Result<Vec<u8>> {
     let device_w = ((opts.width as f32) * opts.dpr).round().max(1.0) as u32;
     let device_h = ((opts.height as f32) * opts.dpr).round().max(1.0) as u32;
@@ -97,31 +121,22 @@ pub fn capture(opts: RenderOptions) -> Result<Vec<u8>> {
         SoftwareRenderingContext::new(initial_size)
             .map_err(|e| anyhow::anyhow!("creating SoftwareRenderingContext: {e:?}"))?,
     );
+    rendering_context
+        .make_current()
+        .map_err(|e| anyhow::anyhow!("rendering_context.make_current: {e:?}"))?;
 
-    // user_agent goes through Preferences in 0.1.x — for now we accept the option
-    // and apply it via opts/prefs in a later patch. Dropping silently here is OK
-    // because Servo's default UA is reasonable.
+    // user_agent goes through Preferences in 0.1.x — accepting the option
+    // and applying it later. Servo's default UA is reasonable in the meantime.
     let _ = &opts.user_agent;
 
     let servo = ServoBuilder::default().build();
     if debug_enabled() {
         servo.setup_logging();
-        dlog!("servo built; rendering_context size={:?}", initial_size);
+        dlog!("servo built; rendering_context size={initial_size:?}");
     }
 
-    // Shared flags. needs_paint: delegate sets on notify_new_frame_ready,
-    // main loop consumes by calling paint+present. load_complete: delegate
-    // sets on LoadStatus::Complete. We wait for load_complete BEFORE
-    // dispatching take_screenshot — empirically, calling take_screenshot
-    // before load even starts means the readiness request is sent to
-    // constellation in a state where pending_changes is non-empty, and
-    // although constellation re-runs the queue when changes clear, in
-    // practice the screenshot callback never fires. Waiting first is the
-    // pattern Servo's own embedders use.
-    let needs_paint = Rc::new(Cell::new(false));
     let load_complete = Rc::new(Cell::new(false));
     let delegate = Rc::new(RenderDelegate {
-        needs_paint: needs_paint.clone(),
         load_complete: load_complete.clone(),
     });
 
@@ -129,56 +144,38 @@ pub fn capture(opts: RenderOptions) -> Result<Vec<u8>> {
         .url(opts.url.clone())
         .delegate(delegate)
         .build();
-    webview.show();
-    dlog!("webview built and shown; url={}", opts.url);
+    dlog!("webview built; url={}", opts.url);
 
-    // Pump until the document fires its load event (LoadStatus::Complete),
-    // also draining frames so the rendering context stays current.
-    let load_deadline = Instant::now() + opts.timeout;
-    while !load_complete.get() {
-        if Instant::now() >= load_deadline {
-            bail!(
-                "page did not load within {}s (last status: {:?})",
-                opts.timeout.as_secs(),
-                webview.load_status()
-            );
-        }
-        servo.spin_event_loop();
-        if needs_paint.get() {
-            needs_paint.set(false);
-            webview.paint();
-            rendering_context.present();
-        }
-    }
+    // Single deadline covers the whole capture (load + screenshot + optional
+    // settle + optional full-page reshot). Predictable upper bound from the
+    // user's perspective rather than per-phase budgets that compound.
+    let deadline = Instant::now() + opts.timeout;
+
+    spin_until(
+        &servo,
+        deadline,
+        &format!(
+            "page did not load within {}s (last status: {:?})",
+            opts.timeout.as_secs(),
+            webview.load_status()
+        ),
+        || load_complete.get(),
+    )?;
     dlog!("page loaded; dispatching take_screenshot");
 
-    // Phase 1: capture at the requested viewport. take_screenshot internally
-    // waits for fonts/images/etc. but the heavy lifting is now done.
-    let rgba = run_screenshot(
-        &servo,
-        &webview,
-        rendering_context.as_ref(),
-        &needs_paint,
-        opts.timeout,
-    )?;
+    let rgba = run_screenshot(&servo, &webview, deadline)?;
 
     if !opts.settle.is_zero() {
-        // Optional human-tunable post-load idle for sites that animate after
-        // their first paint. We pump the loop without blocking on anything.
-        let until = Instant::now() + opts.settle;
-        while Instant::now() < until {
-            servo.spin_event_loop();
-        }
+        let settle_until = (Instant::now() + opts.settle).min(deadline);
+        let _ = spin_until(&servo, settle_until, "(unreachable)", || false);
     }
 
     let final_rgba = if opts.full_page {
-        // Ask the page how tall it is, then resize the viewport to match and
-        // capture again. Bounded so a runaway page can't OOM us.
         let scroll_h = run_eval_number(
             &servo,
             &webview,
             "document.documentElement.scrollHeight",
-            opts.timeout,
+            deadline,
         )?
         .round() as u32;
         let target_h = scroll_h.clamp(device_h, 16384);
@@ -186,13 +183,7 @@ pub fn capture(opts: RenderOptions) -> Result<Vec<u8>> {
             let target = PhysicalSize::new(device_w, target_h);
             rendering_context.resize(target);
             webview.resize(target);
-            run_screenshot(
-                &servo,
-                &webview,
-                rendering_context.as_ref(),
-                &needs_paint,
-                opts.timeout,
-            )?
+            run_screenshot(&servo, &webview, deadline)?
         } else {
             rgba
         }
@@ -205,16 +196,10 @@ pub fn capture(opts: RenderOptions) -> Result<Vec<u8>> {
 }
 
 /// Bridge `WebView::take_screenshot`'s callback onto the calling thread.
-/// Pumps the event loop, AND on every `notify_new_frame_ready` (signalled
-/// via `needs_paint`) calls paint+present so the rendering context is kept
-/// up to date — that's the precondition for take_screenshot to fire its
-/// callback. Without paint+present the callback would never come.
 fn run_screenshot(
     servo: &servo::Servo,
     webview: &servo::WebView,
-    rendering_context: &SoftwareRenderingContext,
-    needs_paint: &Rc<Cell<bool>>,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<RgbaImage> {
     let slot: Rc<RefCell<Option<Result<RgbaImage, String>>>> = Rc::new(RefCell::new(None));
     {
@@ -223,35 +208,27 @@ fn run_screenshot(
             *slot.borrow_mut() = Some(r.map_err(|e| format!("{e:?}")));
         });
     }
-    dlog!("take_screenshot dispatched; pumping event loop");
-    let deadline = Instant::now() + timeout;
-    let mut last_log = Instant::now();
-    let mut paints = 0u64;
-    while slot.borrow().is_none() {
-        if Instant::now() >= deadline {
-            bail!(
-                "timeout waiting for screenshot after {}s (last load_status: {:?}, paints: {})",
-                timeout.as_secs(),
-                webview.load_status(),
-                paints,
-            );
-        }
-        servo.spin_event_loop();
-        if needs_paint.get() {
-            needs_paint.set(false);
-            webview.paint();
-            rendering_context.present();
-            paints += 1;
-        }
-        if debug_enabled() && last_log.elapsed() >= Duration::from_secs(2) {
-            dlog!(
-                "still waiting; load_status={:?} paints={}",
-                webview.load_status(),
-                paints,
-            );
-            last_log = Instant::now();
-        }
-    }
+    dlog!("take_screenshot dispatched");
+
+    let last_log = Cell::new(Instant::now());
+    spin_until(
+        &servo,
+        deadline,
+        &format!(
+            "timeout waiting for screenshot (last load_status: {:?})",
+            webview.load_status()
+        ),
+        || {
+            if debug_enabled() && last_log.get().elapsed() >= Duration::from_secs(5) {
+                eprintln!(
+                    "[shotwright] still waiting; load_status={:?}",
+                    webview.load_status()
+                );
+                last_log.set(Instant::now());
+            }
+            slot.borrow().is_some()
+        },
+    )?;
     let result = slot.borrow_mut().take().unwrap();
     result.map_err(|e| anyhow::anyhow!("screenshot capture failed: {e}"))
 }
@@ -261,7 +238,7 @@ fn run_eval_number(
     servo: &servo::Servo,
     webview: &servo::WebView,
     script: &str,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<f64> {
     let slot: Rc<RefCell<Option<Result<JSValue, String>>>> = Rc::new(RefCell::new(None));
     {
@@ -270,15 +247,10 @@ fn run_eval_number(
             *slot.borrow_mut() = Some(r.map_err(|e| format!("{e:?}")));
         });
     }
-    let deadline = Instant::now() + timeout;
-    while slot.borrow().is_none() {
-        if Instant::now() >= deadline {
-            bail!("timeout waiting for JS evaluation");
-        }
-        servo.spin_event_loop();
-    }
-    // Bind the result to a local before the match so the RefMut temporary
-    // is dropped before `slot` itself is dropped at end of scope.
+    spin_until(&servo, deadline, "timeout waiting for JS evaluation", || {
+        slot.borrow().is_some()
+    })?;
+    // Bind before match so RefMut temporary drops before slot does.
     let result = slot.borrow_mut().take().unwrap();
     match result {
         Ok(JSValue::Number(n)) => Ok(n),
