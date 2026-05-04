@@ -49,6 +49,7 @@ macro_rules! dlog {
 /// Debug prints are gated on `SHOTWRIGHT_DEBUG=1`.
 struct RenderDelegate {
     needs_paint: Rc<Cell<bool>>,
+    load_complete: Rc<Cell<bool>>,
 }
 
 impl WebViewDelegate for RenderDelegate {
@@ -58,6 +59,9 @@ impl WebViewDelegate for RenderDelegate {
     }
     fn notify_load_status_changed(&self, _wv: WebView, status: LoadStatus) {
         dlog!("load_status: {status:?}");
+        if matches!(status, LoadStatus::Complete) {
+            self.load_complete.set(true);
+        }
     }
     fn notify_url_changed(&self, _wv: WebView, url: Url) {
         dlog!("url_changed: {url}");
@@ -105,12 +109,20 @@ pub fn capture(opts: RenderOptions) -> Result<Vec<u8>> {
         dlog!("servo built; rendering_context size={:?}", initial_size);
     }
 
-    // Shared flag: delegate sets it on notify_new_frame_ready, main loop
-    // consumes it by calling paint+present. Without this, take_screenshot
-    // waits forever because frames are produced but never composited.
+    // Shared flags. needs_paint: delegate sets on notify_new_frame_ready,
+    // main loop consumes by calling paint+present. load_complete: delegate
+    // sets on LoadStatus::Complete. We wait for load_complete BEFORE
+    // dispatching take_screenshot — empirically, calling take_screenshot
+    // before load even starts means the readiness request is sent to
+    // constellation in a state where pending_changes is non-empty, and
+    // although constellation re-runs the queue when changes clear, in
+    // practice the screenshot callback never fires. Waiting first is the
+    // pattern Servo's own embedders use.
     let needs_paint = Rc::new(Cell::new(false));
+    let load_complete = Rc::new(Cell::new(false));
     let delegate = Rc::new(RenderDelegate {
         needs_paint: needs_paint.clone(),
+        load_complete: load_complete.clone(),
     });
 
     let webview = WebViewBuilder::new(&servo, rendering_context.clone())
@@ -120,8 +132,28 @@ pub fn capture(opts: RenderOptions) -> Result<Vec<u8>> {
     webview.show();
     dlog!("webview built and shown; url={}", opts.url);
 
+    // Pump until the document fires its load event (LoadStatus::Complete),
+    // also draining frames so the rendering context stays current.
+    let load_deadline = Instant::now() + opts.timeout;
+    while !load_complete.get() {
+        if Instant::now() >= load_deadline {
+            bail!(
+                "page did not load within {}s (last status: {:?})",
+                opts.timeout.as_secs(),
+                webview.load_status()
+            );
+        }
+        servo.spin_event_loop();
+        if needs_paint.get() {
+            needs_paint.set(false);
+            webview.paint();
+            rendering_context.present();
+        }
+    }
+    dlog!("page loaded; dispatching take_screenshot");
+
     // Phase 1: capture at the requested viewport. take_screenshot internally
-    // waits for the document, all subresources, and pending render frames.
+    // waits for fonts/images/etc. but the heavy lifting is now done.
     let rgba = run_screenshot(
         &servo,
         &webview,
