@@ -12,16 +12,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # aarch64 is built only on tagged releases; while iterating x86_64-only
+        # halves CI time and matches the host we're targeting (AlmaLinux 8 x86_64).
         include:
           - arch: x86_64
             runner: ubuntu-latest
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
+          # - arch: aarch64
+          #   runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - name: Build artifact
         working-directory: shotwright-engine
+        env:
+          # GitHub Actions buildx layer cache. First run after enabling
+          # populates the cache; subsequent src/-only changes reuse the
+          # heavy mozjs/SpiderMonkey layers and finish in ~5–10 min.
+          SHOTWRIGHT_CI_CACHE: gha
         run: ARCH=${{ matrix.arch }} ./build/package.sh
       - uses: actions/upload-artifact@v4
         with:

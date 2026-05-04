@@ -52,6 +52,19 @@ if [ -n "${BUILD_MEM:-}" ]; then
     BUILDX_FLAGS+=(--builder "${BUILDER}")
 fi
 
+# Enable buildx layer cache when SHOTWRIGHT_CI_CACHE is set (CI passes
+# "gha" to use GitHub Actions cache; locally you can use "registry,ref=..."
+# or "local,dest=..."). The first run with caching enabled is slow because
+# it populates the cache; subsequent runs that only change src/ rebuild
+# only the final cargo layer (~5–10 min vs ~40 min cold).
+if [ -n "${SHOTWRIGHT_CI_CACHE:-}" ]; then
+    SCOPE="${ARCH:-default}"
+    BUILDX_FLAGS+=(
+        --cache-from "type=${SHOTWRIGHT_CI_CACHE},scope=${SCOPE}"
+        --cache-to   "type=${SHOTWRIGHT_CI_CACHE},mode=max,scope=${SCOPE}"
+    )
+fi
+
 docker buildx build \
     "${BUILDX_FLAGS[@]}" \
     --platform "${DOCKER_PLATFORM}" \
